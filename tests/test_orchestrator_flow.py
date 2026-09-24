@@ -1502,6 +1502,63 @@ def test_an_ordinary_reply_is_untouched():
     assert _strip_agenda_suffix(reply, agenda) == reply
 
 
+def test_a_reaction_restating_the_topic_is_not_amputated():
+    """Templating made the agenda item a string the model echoes every turn.
+
+    Before that the item text was the model's own prose and rarely reappeared
+    verbatim inside a reaction. Now "years of experience" is fixed text the
+    model sees constantly, so a reaction that legitimately ENDS on it -- the
+    candidate's own figure attached to their own topic -- hits the suffix
+    branch and gets cut down to the figure alone:
+
+        "You have four years of experience"   -> "You have four."
+        "You mentioned years of experience"    -> "You mentioned."
+
+    Both are fragments Riya would speak out loud. The distinguishing fact is
+    the head's LAST word: a note arrives after a clause that has finished, and
+    a clause ending on a number or a verb has not finished -- it is waiting for
+    exactly the phrase being deleted. "mentioned" and "noted" are the reason
+    the test is a past-tense fallback rather than more entries in
+    _FINITE_VERB, which is an explicit list and contains neither.
+    """
+    from voice_agent.orchestrator import _strip_agenda_suffix
+
+    agenda = ["qualification and field?", "years of experience?"]
+    for reply in (
+        "You mentioned years of experience",
+        "You noted years of experience",
+        "You mentioned years of experience in your previous work",
+        "You have four years of experience",
+        "Four years of experience sounds good.",
+        "Six years of work experience sounds impressive.",
+        "Four years of experience is solid",
+        "5 years of experience is solid",
+    ):
+        assert _strip_agenda_suffix(reply, agenda) == reply, reply
+
+
+def test_a_note_after_a_finished_clause_is_still_cut():
+    """The guard must not cost us run 18's leaks.
+
+    Every head here ends on an adverb, a preposition or a noun -- a clause
+    that has FINISHED. That is what a bolted-on note looks like, and these
+    must still come out of the reply.
+    """
+    from voice_agent.orchestrator import _strip_agenda_suffix
+
+    agenda = ["qualification and field?", "years of experience?",
+              "read back and confirm?"]
+    assert _strip_agenda_suffix(
+        "when you're available again qualification and field?", agenda
+    ) == "when you're available again."
+    assert _strip_agenda_suffix(
+        "job openings at our clients years of experience?", agenda
+    ) == "job openings at our clients."
+    assert _strip_agenda_suffix(
+        "how you use it?\nRead back and confirm?", agenda
+    ) == "how you use it?"
+
+
 def test_parroting_the_caller_is_caught():
     """A live turn answered "working with the big team" with the same words back.
 
@@ -2806,6 +2863,72 @@ def test_a_warn_only_kind_is_still_spoken():
     # has never helped, but neither does deleting them without judgement.
     for kind in ("fabrication", "person", "off_topic", "question", "contact"):
         assert kind not in _CUT_KINDS, kind
+
+
+@pytest.mark.asyncio
+async def test_a_tail_of_a_dropped_reaction_does_not_reach_the_speaker():
+    """Run 48 turn 6. The caller heard "Today if there are.".
+
+    The model said "suitable positions that match our previous discuss[ion]"
+    -- the gate dropped that -- and then, in a SEPARATE chunk, "Today if there
+    are.". The stranded-tail rule already existed but was keyed on the tail
+    arriving immediately and being <= 3 words. This one was four words, so it
+    survived and the caller heard a fragment of a sentence whose head had
+    already been thrown away.
+
+    That bound was tuned to run 38's instance, which is the same mistake as the
+    `[a-z\\s]{0,24}` window in _CALL_NARRATION. The invariant is "the reaction
+    is already gone", not "the next chunk is short".
+
+    Driven through _consume_chunks with an explicit queue: FakeLLM streams one
+    word at a time, so the chunker coalesces a scripted reply into a single
+    chunk and the two-chunk case cannot be expressed through the LLM fake.
+    """
+    from voice_agent.orchestrator import _SENTINEL
+
+    agent = make_agent("", max_sentences=0)
+    agent._loop = asyncio.get_running_loop()
+    m = TurnMetrics(turn_id=1)
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait("suitable positions that match our previous discuss")
+    queue.put_nowait("Today if there are.")
+    queue.put_nowait(_SENTINEL)
+
+    spoken, rejected = await agent._consume_chunks(
+        queue, m, threading.Event(), guard=False, repair=True,
+        gate_reaction=True,
+    )
+
+    assert rejected is None, "the gate must not veto -- no second generation"
+    assert "Today if there are" not in spoken, spoken
+    assert not spoken.strip(), spoken
+
+
+@pytest.mark.asyncio
+async def test_a_later_reaction_addressed_to_the_caller_still_survives():
+    """The stranded-tail rule must not swallow a real reaction.
+
+    It clears as soon as a chunk arrives that IS about the candidate. Without
+    that, one bad first chunk would empty the whole turn -- including the good
+    reaction that followed it.
+    """
+    from voice_agent.orchestrator import _SENTINEL
+
+    agent = make_agent("", max_sentences=0)
+    agent._loop = asyncio.get_running_loop()
+    m = TurnMetrics(turn_id=1)
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait("That helps narrow down our search options.")
+    queue.put_nowait("You've completed under graduation in computer science.")
+    queue.put_nowait(_SENTINEL)
+
+    spoken, rejected = await agent._consume_chunks(
+        queue, m, threading.Event(), guard=False, repair=True,
+        gate_reaction=True,
+    )
+
+    assert "narrow down our search" not in spoken, spoken
+    assert "under graduation in computer science" in spoken, spoken
 
 
 def test_the_reaction_gate_keeps_reactions_about_the_candidate():

@@ -544,6 +544,32 @@ def _strip_agenda_suffix(reply: str, agenda: list[str]) -> str:
         before = kept.split()[-1].strip(".,!?;:").lower() if kept.split() else ""
         if before in _AGENDA_BINDERS:
             continue
+        # THE HEAD MUST NOT END ON A VERB OR A NUMBER -- the same test as the
+        # mid-sentence branch below, and it belongs HERE, because this is the
+        # branch that actually fires when the topic ends the sentence.
+        #
+        # Recorded because four attempts went into the wrong branch first: with
+        # the templated items, "years of experience" is a fixed string the
+        # model echoes, and a reaction that naturally ENDS with it ("You have
+        # four years of experience", "You mentioned years of experience") hits
+        # the SUFFIX test here, not the `find` test below. Guards added to the
+        # other branch changed nothing observable, which is what made it look
+        # like the test itself was wrong.
+        #
+        #   "You have four years of experience"   kept "You have four"
+        #        -> ends on a QUANTIFIER: the deleted noun phrase is what "four"
+        #           was counting. Returned "You have four."
+        #   "You mentioned years of experience"   kept "You mentioned"
+        #        -> ends on a VERB: its object is what we just deleted.
+        #   "when you're available again qualification and field"  kept
+        #        "when you're available again"
+        #        -> ends on an ADVERB: a finished clause. Legitimate, still cut.
+        #
+        # A note arrives after a clause that has FINISHED. A sentence finishing
+        # on a verb or a bare number has not finished -- it is waiting for
+        # exactly the words being removed.
+        if _head_cannot_take_the_cut(before):
+            continue
         # The chunker splits mid-sentence, so what is left of a real sentence
         # can already carry its own terminator ("...how you use" / "it?").
         # Appending another one there produced "it?.".
@@ -561,7 +587,28 @@ def _strip_agenda_suffix(reply: str, agenda: list[str]) -> str:
             continue
         if not tail.lower().endswith(word.lower()):
             continue
-        kept = tail[: len(tail) - len(word)].rstrip(" \t\r\n,;:-")
+        # THE MATCH MUST START ON A WORD BOUNDARY. Without this, "years" inside
+        # "Four years of experience" matched as a bare suffix and the stripper
+        # returned "Four sounds good." -- Riya commenting on the number alone.
+        # Measured: "You have four years of experience" -> "You have four.",
+        # "You mentioned years of experience" -> "You mentioned." (a fragment),
+        # 3 of 9 realistic reactions damaged.
+        #
+        # This became reachable once the agenda items were templated: before
+        # that the item text was the model's own prose and rarely appeared
+        # verbatim inside a reaction. Now "years of experience" is a fixed
+        # string the model sees every turn and echoes.
+        #
+        # Why the char before matters: the caller's figure sits directly in
+        # front of the topic ("four years of experience", "six years of
+        # experience"), so a match mid-word-boundary always amputates a real
+        # noun phrase. A note genuinely bolted on has whitespace or punctuation
+        # in front of it -- that is what "standing on its own" means, and it is
+        # the same test the single-topic-word branch below already applies.
+        head = len(tail) - len(word)
+        if head > 0 and tail[head - 1] not in " \t\r\n.,;:!?-":
+            continue
+        kept = tail[:head].rstrip(" \t\r\n,;:-")
         if not kept or kept[-1:] not in ".?!:;":
             continue
         if not any(ch.isalnum() for ch in kept):
@@ -580,17 +627,98 @@ def _strip_agenda_suffix(reply: str, agenda: list[str]) -> str:
         at = out.lower().find(bare.lower())
         if at <= 0:
             continue
+        # WORD BOUNDARIES ON BOTH SIDES, or this branch eats the candidate's
+        # own figures. It matched "years of experience" inside
+        # "Four years of experience sounds good." and returned "Four sounds
+        # good." -- Riya commenting on the number alone, having deleted the
+        # noun phrase that makes it mean anything. Same for
+        # "You have four years of experience" -> "You have four."
+        #
+        # `find` matches ANYWHERE, so unlike the suffix branches this one needs
+        # the left test explicitly; without it a mid-word hit is possible too.
+        if at > 0 and out[at - 1] not in " \t\r\n.,;:!?-(\"'" "'":
+            continue
+        end = at + len(bare)
+        if end < len(out) and out[end] not in " \t\r\n.,;:!?-)\"'" "'":
+            continue
         head = out[:at].rstrip()
         if not head:
             continue
         before = head.split()[-1].strip(".,!?;:").lower()
         if before in _AGENDA_BINDERS:
             continue
+        # THE HEAD MUST NOT END ON A VERB OR A NUMBER. That single test is what
+        # separates the two cases, and it is the only one of several attempts
+        # that actually does:
+        #
+        #   "You have four years of experience"   head "You have four"
+        #        -> ends on a QUANTIFIER: the noun phrase we just deleted is
+        #           what "four" was counting. Cut gives "You have four."
+        #   "You mentioned years of experience"   head "You mentioned"
+        #        -> ends on a VERB: the object is gone, so the sentence is
+        #           incomplete. Cut gives "You mentioned."
+        #   "when you're available again qualification and field"  head
+        #        "when you're available again"
+        #        -> ends on an ADVERB: complete clause. This is the legitimate
+        #           case (run 18) and it must still be cut.
+        #
+        # A note arrives after a clause that has FINISHED. A sentence that
+        # finishes on a verb or a bare number has not finished -- it is waiting
+        # for the very phrase we are about to delete.
+        #
+        # Two earlier attempts are recorded here because both failed: a
+        # left-side word-boundary test (the damaging case has a space on both
+        # sides, like any real note, so it passed), and a _FINITE_VERB test on
+        # the head (both heads contain a finite verb, so it passed). The
+        # distinguishing fact is the LAST word, not the presence of a verb --
+        # see _head_cannot_take_the_cut, which both branches now share.
+        if _head_cannot_take_the_cut(before):
+            continue
         pruned = (head + " " + out[at + len(bare):].lstrip()).strip()
         if not any(ch.isalnum() for ch in pruned):
             return ""
         return re.sub(r"\s{2,}", " ", pruned)
     return reply
+
+
+# The single test that separates the two cases, shared by both branches of
+# _strip_agenda_suffix. A note arrives after a clause that has FINISHED; a
+# clause ending on a verb or a bare number has not finished -- it is waiting
+# for exactly the words being deleted.
+#
+#   "You have four years of experience"   head "You have four"
+#        -> ends on a QUANTIFIER: the deleted noun phrase is what "four" was
+#           counting. Cutting gives "You have four."
+#   "You mentioned years of experience"   head "You mentioned"
+#        -> ends on a VERB: its object is what we just deleted. Cutting gives
+#           "You mentioned."
+#   "when you're available again qualification and field"  head
+#        "when you're available again"
+#        -> ends on an ADVERB: a finished clause. Legitimate, still cut.
+#
+# _FINITE_VERB is an explicit LIST, so it has always missed "mentioned" and
+# "noted" -- the exact two verbs a reaction uses when it restates a topic the
+# candidate covered. Rather than grow the list (which is a wording chase in
+# miniature), any past-tense word is also refused: a head ending on "-ed" is
+# the same amputated clause. Checked before the list so the fallback cannot
+# widen the verb set beyond forms the list already contains.
+_HEAD_END_NUMBER = re.compile(
+    r"\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
+    r"|couple|several|many|few|[a-z]+-?\d+",
+    re.I,
+)
+_HEAD_END_PAST = re.compile(r"[a-z]{3,}ed", re.I)
+
+
+def _head_cannot_take_the_cut(before: str) -> bool:
+    """True when deleting a trailing noun phrase would leave a fragment."""
+    if not before:
+        return False
+    if _HEAD_END_NUMBER.fullmatch(before):
+        return True
+    if _HEAD_END_PAST.fullmatch(before):
+        return True
+    return bool(_FINITE_VERB.fullmatch(before))
 
 
 # Words that, sitting immediately before a checklist item, mean the item is
@@ -1636,6 +1764,11 @@ def _only_a_fragment(text: str) -> bool:
 # because a reaction that fails this test is not repaired -- it is replaced by
 # nothing at all. That is the same move as templating the questions.
 _REACTION_MAX_WORDS = 20
+# Ceiling for a chunk left stranded after the reaction was dropped. Generous
+# on purpose -- this is no longer the test that identifies a tail (the dropped
+# reaction is), it only prevents a genuinely long speech from being thrown away
+# on the strength of an earlier cut.
+_STRANDED_TAIL_MAX_WORDS = 8
 # Stating a general fact about a tool rather than about the candidate.
 # Run 46 turn 5, after the candidate named their stack: "Python is widely
 # used in data analysis." Predicated of the technology, not of the person --
@@ -3428,6 +3561,12 @@ class VoiceAgent:
         # in the next, where there is nothing left to judge it against. See
         # its use below.
         emptied = False
+        # Separate from `emptied`, which is cleared every chunk. This one means
+        # "the model's line for this turn is already gone", and it only clears
+        # when a chunk arrives that is addressed to the candidate. It has to
+        # survive across chunks, because run 48 turn 6's tail was separated
+        # from its head by another chunk and the adjacency test missed it.
+        reaction_dropped = False
         self._blocked_bail = False
         # Greeting words still unmatched this turn, and how many have been
         # matched so far. Reset every pass: see _eat_greeting.
@@ -3695,16 +3834,46 @@ class VoiceAgent:
                 # "experience." -- the drop took the first, and the tail went
                 # out on its own in front of the templated question.
                 #
-                # A tail is short, because there is not much of a clause left
-                # once its head is gone. Deliberately NOT applied after the
-                # model-question drop: the model asks a question on almost
-                # every turn, so that path is routine and a genuinely short
-                # reaction could follow it.
-                if emptied and len(item.split()) <= 3 and "?" not in item:
-                    self.on_event(
-                        "system", f"(dropped stranded tail: {item[:40]!r})"
-                    )
-                    continue
+                # KEYED ON THE CONDITION, NOT ON THE NEXT CHUNK BEING CLOSE.
+                # This used to be `if emptied and len(item.split()) <= 3`, and
+                # both halves of that were wrong. Run 48 turn 6 showed it:
+                #
+                #   chunk A  "suitable positions that match our previous discuss"
+                #            -> dropped by the reaction gate
+                #   chunk B  "Today if there are."          -> 4 words, survived
+                #
+                # The caller heard "Today if there are. Have a good day..." --
+                # an audible fragment of a sentence whose head had already been
+                # thrown away. Run 38's tail happened to arrive immediately and
+                # happened to be <= 3 words, so the narrow version looked right
+                # for two runs. That is the same mistake as the
+                # `[a-z\s]{0,24}` window in _CALL_NARRATION: a bound tuned to
+                # the instance that produced it, correct only until the instance
+                # changes shape.
+                #
+                # The invariant is not "the next chunk is short". It is: THIS
+                # TURN'S REACTION HAS ALREADY BEEN DROPPED, so anything the model
+                # goes on to say in prose has no line to attach to and is a tail
+                # by construction. The templated question is what the caller
+                # actually hears, and it is appended regardless -- the same
+                # reason _MAY_EMPTY and the reaction gate are free.
+                #
+                # `you` keeps real reactions that arrive in later chunks: a line
+                # addressed to the candidate is a reaction, not a tail. The word
+                # ceiling stays, raised, because it is now only excluding
+                # reactions rather than catching tails -- and a reaction longer
+                # than this is the thing the gate drops anyway.
+                if reaction_dropped and not _REACTION_ABOUT_THEM.search(item):
+                    if len(item.split()) <= _STRANDED_TAIL_MAX_WORDS and "?" not in item:
+                        self.on_event(
+                            "system", f"(dropped stranded tail: {item[:40]!r})"
+                        )
+                        continue
+                else:
+                    # A chunk that IS addressed to the candidate ends the
+                    # stranded-tail condition: from here the model is answering
+                    # the caller again, not trailing off the line we removed.
+                    reaction_dropped = False
                 emptied = False
 
                 # Run 25 turn 6. Ending the call is the caller's decision;
@@ -3746,6 +3915,7 @@ class VoiceAgent:
                         "system", f"(reaction dropped: {item[:50]!r})"
                     )
                     emptied = True
+                    reaction_dropped = True
                     continue
 
             if checking_open:
