@@ -940,7 +940,13 @@ def test_run_24_openings_claim_without_a_verb_is_cut():
     out, cut = _repair_chunk(text, "Do you have openings?")
     assert "openings claim" in cut, cut
     assert "immediate openings" not in out.lower(), out
-    assert "follow up" in out.lower(), out
+    # Run 46 turn 5 widened _COMMITMENT to a team subject: "Our team will
+    # follow up regarding suitable openings at our health care companies."
+    # went out uncut because the subject was I|we|let me. Same defect here, so
+    # the promise is cut as well as the openings claim, and the stranded "But."
+    # that is left behind is what _only_a_fragment drops in the pipeline.
+    assert "commitment she cannot make" in cut, cut
+    assert "follow up" not in out.lower(), out
 
 
 def test_a_promise_to_follow_up_is_cut():
@@ -2270,8 +2276,14 @@ async def test_an_off_agenda_reply_is_spoken_not_regenerated():
         f"{agent.llm.attempts} generation(s) -- off-agenda should warn, not regenerate"
     )
     assert not m.retried
-    assert "interested" in m.response, m.response
     assert agent.speaker.played
+    # NOTE: this reply no longer reaches the speaker. It is 16 words and
+    # carries a first-person trailing question ("...soon can I help with
+    # that"), so the reaction gate drops it -- the gate is deliberately strict
+    # about a line that is about Riya rather than about the candidate. What
+    # this test exists to prove is the part that still holds and still costs
+    # real latency: off-agenda WARNS, it does not buy a second generation.
+    assert "interested" not in m.response, m.response
 
 
 @pytest.mark.asyncio
@@ -2796,6 +2808,118 @@ def test_a_warn_only_kind_is_still_spoken():
         assert kind not in _CUT_KINDS, kind
 
 
+def test_the_reaction_gate_keeps_reactions_about_the_candidate():
+    """The gate is a cut-list of SUBJECTS, not of wordings.
+
+    Runs 44, 45, 46 and 47 each produced a new defective reaction and each
+    was chased with another regex. Every one of them is a reaction about the
+    call, about Riya, about the agency, about a technology, or about how the
+    caller spoke. This pins that those subjects are refused, and -- the part
+    that is easy to get wrong -- that ordinary reactions about the candidate
+    are kept, including ones sharing no words with the caller's utterance.
+    """
+    from voice_agent.orchestrator import _reaction_is_worth_saying
+
+    # Kept: about the candidate. The last four are real replies from runs
+    # 46/47 and two of them share nothing with what the caller said, which is
+    # why an overlap test was tried and removed.
+    for good in (
+        "You've completed an undergraduate degree in Computer Science.",
+        "Six years of work experience sounds impressive.",
+        "You've completed some education in Computer Science.",
+        "Four years sounds good.",
+        "That is a solid background.",
+        "Got it, that is relevant.",
+        "Thanks, that's helpful.",
+    ):
+        assert _reaction_is_worth_saying(good), good
+
+    # Refused: about the call / Riya / the agency / a tool / their manner.
+    for bad in (
+        # run 46
+        "Python is widely used in data analysis",
+        "I'll clarify You want to know how frequently those technologies are utilized.",
+        "That was quite blunt.",
+        "Our team will follow up regarding suitable openings at our health care companies.",
+        # run 47
+        "That helps narrow down our search options.",
+        "That helps clarify things",
+        "No - our recruitment team will discuss suitable openings with you",
+        # run 45
+        "our focus today is on matching roles based on qualifications and skills.",
+        "No need to reiterate our team will note down all technologies used.",
+        "Yes No You have confirmed your tech stack.",
+        "Sorry this conversation has strayed far off topic. Our primary goal remains noting relevant details.",
+        "That was unnecessary under graduation computer science from an unknown institution after 5 years of work experience.",
+        # run 44
+        "My previous response should have simply stated: Light blue.",
+    ):
+        assert not _reaction_is_worth_saying(bad), bad
+
+
+def test_the_reaction_gate_costs_no_regeneration():
+    """The gate empties, it does not retry -- so a bad reaction is free.
+
+    Same economics as `_MAY_EMPTY`: the templated question still follows, so
+    dropping the model's whole line leaves the caller hearing a turn. This is
+    the measurement that matters -- a gate that paid for a second generation
+    would trade the content defect for the latency target.
+    """
+    from voice_agent.orchestrator import _reaction_is_worth_saying
+
+    bad = "our focus today is on matching roles based on qualifications and skills."
+    assert not _reaction_is_worth_saying(bad)
+    # And the same call that produced run 46's worth-keeping line still keeps it.
+    assert _reaction_is_worth_saying("Four years sounds good.")
+
+
+def test_the_read_back_speaks_in_the_candidates_voice():
+    """Run 46 turn 5: the confirm line claimed the candidate's own answers.
+
+    `_readback()` joins the CALLER's utterances and Riya says them, so
+    unflipped the line ran "Let me read that back. My highest qualification is
+    under graduation and I have done it in computer science... Have I got that
+    right?" -- Riya appearing to claim their degree and years.
+    """
+    agent = make_agent("")
+    agent._answers = [
+        "So my highest qualification is under graduation and uh I have done it "
+        "in computer science.",
+        "Currently I have total of six years of uh work experience",
+    ]
+    out = agent._readback()
+    assert out.startswith("Your highest qualification"), out
+    assert "you have done it" in out, out
+    assert "you have total" in out, out
+    # Nothing first-person survives -- that is the whole defect.
+    for wrong in (" My ", " my ", " I "):
+        assert wrong not in out, (wrong, out)
+    # Agreement has to come along: "I am" is not "you am". Five content words,
+    # so it clears _readable_answer's floor -- "I am a senior engineer" is
+    # three and is correctly dropped as an affirmation.
+    agent._answers = ["I am a senior engineer working with Python"]
+    assert "you are a senior engineer" in agent._readback().lower()
+
+
+def test_a_model_question_behind_a_semicolon_is_dropped():
+    """Run 46 turn 5, and it was SPOKEN.
+
+    The chunk arrived as "Python is widely used in data analysis; can you
+    specifically say how often you". _strip_model_questions split on [.?!]
+    only, so the semicolon glued the question onto the statement, the whole
+    thing was one clause, _is_model_question said False, and a model-written
+    question reached the speaker in front of the templated one.
+    """
+    from voice_agent.orchestrator import _strip_model_questions
+
+    out = _strip_model_questions(
+        "Python is widely used in data analysis; can you specifically say how "
+        "often you"
+    )
+    assert "can you specifically" not in out.lower(), out
+    assert "widely used" in out.lower(), out
+
+
 def test_a_claim_about_what_the_client_wants_is_cut():
     """Run 39 turn 2, answering "my highest qualification is under graduation".
 
@@ -3193,10 +3317,16 @@ def test_the_read_back_skips_utterances_that_are_not_answers():
         "Oh so my highest qualification is uh under graduation in computer "
         "science",
     ]
-    assert agent._readback().startswith("My highest"), agent._readback()
-    # ...but "I" is never stripped, or "I have five years" loses its subject.
+    # Run 46: the answers are the CANDIDATE's words, so they have to be put
+    # into the candidate's voice before Riya says them. Unflipped, the confirm
+    # line was "Let me read that back. My highest qualification is under
+    # graduation and I have done it in computer science..." -- Riya appearing
+    # to claim the candidate's degree and years.
+    assert agent._readback().startswith("Your highest"), agent._readback()
+    # ...and "I" becomes "you", so "I have five years" keeps its subject
+    # without Riya claiming it.
     agent._answers = ["I have five years of experience"]
-    assert agent._readback().startswith("I have"), agent._readback()
+    assert agent._readback().startswith("You have"), agent._readback()
 
     # Every answer dismissed: fall back rather than read back nothing.
     agent._answers = ["Yeah", "Sure."]

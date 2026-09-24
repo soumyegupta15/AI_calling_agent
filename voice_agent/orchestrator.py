@@ -1033,6 +1033,51 @@ def _readable_answer(answer: str) -> str:
     return " ".join(words)
 
 
+# Run 46 turn 5. The read-back joins the CALLER's own utterances and Riya
+# speaks them, so the caller's "my" and "I" come out of her mouth:
+#   "Let me read that back. My highest qualification is under graduation and
+#    I have done it in computer science and Currently I have total of six
+#    years of work experience. Have I got that right?"
+# Riya appears to claim the candidate's degree and years. The answers are the
+# candidate's words, so they have to be put into the candidate's voice before
+# Riya says them. Token-level, no parsing: every first-person form has exactly
+# one second-person counterpart here.
+_SECOND_PERSON_FLIP = {
+    "i": "you", "i'm": "you're", "i've": "you've", "i'll": "you'll",
+    "i'd": "you'd", "me": "you", "my": "your", "mine": "yours",
+    "myself": "yourself",
+}
+# Agreement, which a token map cannot do: "I am" is not "you am".
+_SECOND_PERSON_PHRASES = (
+    (re.compile(r"\bI\s+am\b", re.I), "you are"),
+    (re.compile(r"\bI\s+was\b", re.I), "you were"),
+)
+
+
+def _to_second_person(text: str) -> str:
+    """Put the caller's own words into the caller's voice, for Riya to quote.
+
+    Only ever applied to a read-back, where every first-person pronoun in the
+    text belongs to the candidate and must stay theirs.
+    """
+    out = text
+    for pattern, replacement in _SECOND_PERSON_PHRASES:
+        out = pattern.sub(replacement, out)
+    # Always the lowercase replacement, even where the candidate wrote "I" or
+    # "My". Capitalising it put "You have done it in computer science" in the
+    # middle of a sentence. Case belongs to the caller of this function --
+    # _readback() uppercases the first character of the finished read-back,
+    # which is the only place a capital is wanted.
+    words = out.split(" ")
+    flipped = []
+    for w in words:
+        bare = w.strip(".,!?;:")
+        if bare.lower() in _SECOND_PERSON_FLIP:
+            w = w.replace(bare, _SECOND_PERSON_FLIP[bare.lower()], 1)
+        flipped.append(w)
+    return " ".join(flipped)
+
+
 def _is_model_question(clause: str) -> bool:
     """Is this clause a question the model wrote, so Python should drop it?
 
@@ -1067,7 +1112,13 @@ def _strip_model_questions(text: str) -> str:
     if not text or not text.strip():
         return text
     clauses: list[str] = []
-    for part in re.split(r"(?<=[.?!])\s+|\n+", text):
+    # ";" is a clause boundary too. Run 46 turn 5 streamed
+    # "Python is widely used in data analysis; can you specifically say how
+    # often you" as ONE chunk: with the semicolon not split on, the whole
+    # thing was a single clause, _is_model_question returned False for it, and
+    # a model-written question went to the speaker. Splitting only on [.?!]
+    # meant the question had to be at the start of a clause to be seen.
+    for part in re.split(r"(?<=[.?!;])\s+|\n+", text):
         piece = part.strip()
         if not piece:
             continue
@@ -1266,7 +1317,15 @@ _CUT = "cut"
 # our client companies soon." She has no client list and no mandate; the
 # config says no commitment -- no callback, no date, no "we'll be in touch".
 _COMMITMENT = re.compile(
-    r"\b(?:I(?:'ll|\s+will|\s+shall)|we(?:'ll|\s+will)|let\s+me)\s+"
+    # Subject widened for run 46 turn 5: "Our team will follow up regarding
+    # suitable openings at our health care companies." The subject was
+    # I|we|let me, so a promise whose subject is the TEAM was invisible -- and
+    # it is the same defect, an agency-side commitment she cannot make. Keyed
+    # on the subject rather than adding "follow up" to a verb list, because
+    # the next wording will pick a different verb.
+    r"\b(?:I(?:'ll|\s+will|\s+shall)|we(?:'ll|\s+will)|let\s+me"
+    r"|(?:our|the)\s+(?:team|recruiter|recruitment\s+team|staffing\s+team"
+    r"|hiring\s+team|company|hr)(?:\s+(?:will|'ll|shall))?)\s+"
     r"(?:check|look|see|find|confirm|get\s+back|follow\s+up|let\s+you\s+know"
     r"|call\s+you|reach\s+out|update|share|send|arrange|search|review|forward"
     r"|ask)\b[^.?!]{0,60}",
@@ -1548,6 +1607,134 @@ def _only_a_fragment(text: str) -> bool:
 
     return False
 
+
+
+# ----------------------------------------------------------- the reaction gate
+#
+# Runs 44, 45 and 46 each produced reaction lines that no rule recognised, in
+# a new wording every time. They are one family: the reaction is ABOUT the
+# call, about her, about the team, about the technology, or about the
+# caller's manner -- anything except the candidate and their answer.
+#
+#   run 46: "Python is widely used in data analysis"      (about the tool)
+#           "I'll clarify You want to know how frequently those technologies
+#            are utilized."                                (about her / the call)
+#           "That was quite blunt."                        (about their manner)
+#   run 45: "our focus today is on matching roles..."
+#           "No need to reiterate our team will note down..."
+#           "Yes No You have confirmed your tech stack."
+#           "Sorry this conversation has strayed far off topic..."
+#   run 44: "My previous response should have simply stated: Light blue."
+#
+# Thirteen regexes chase this family and the chase does not converge -- the
+# 3B writes a new wording faster than a pattern can be added. So this is an
+# ALLOWLIST, not another blocklist: a reaction is spoken only when it is
+# provably about the candidate. Everything else is dropped, and dropping is
+# free because the templated question still follows.
+#
+# The fallback is what ends the chase. There is no "next wording" to catch,
+# because a reaction that fails this test is not repaired -- it is replaced by
+# nothing at all. That is the same move as templating the questions.
+_REACTION_MAX_WORDS = 20
+# Stating a general fact about a tool rather than about the candidate.
+# Run 46 turn 5, after the candidate named their stack: "Python is widely
+# used in data analysis." Predicated of the technology, not of the person --
+# a screener already knows what Python is for. Keyed on "<tool> is ... used",
+# which is the shape every wording of this reaches for.
+_REACTION_TOOL_CLAIM = re.compile(
+    r"\b\w[\w+#./-]*\s+(?:is|are|was|were)\s+"
+    r"(?:widely|commonly|generally|often|typically|frequently|mostly|usually"
+    r"|mainly|popularly|increasingly)?\s*used\b",
+    re.I,
+)
+# Commenting on HOW they spoke rather than on what they said. Run 46 turn 7,
+# after an insult: "That was quite blunt." Run 45 turn 7: "That was
+# unnecessary...". Deliberately a closed list of manner words, so it cannot
+# reach "That is a solid background." -- the intensifier is optional because
+# "That was unnecessary." has none.
+_REACTION_ON_THEIR_MANNER = re.compile(
+    r"^(?:that|this|it)\s+(?:was|is|were|are|sounds|seems|felt)\s+"
+    r"(?:quite|very|rather|really|pretty|extremely|somewhat|fairly|totally"
+    r"|incredibly|a\s+bit|a\s+little)?\s*"
+    r"(?:blunt|rude|unnecessary|inappropriate|offensive|harsh|unkind|mean"
+    r"|personal|weird|odd|strange|confusing|unclear|silly|aggressive|crude"
+    r"|dismissive|snide)\b",
+    re.I,
+)
+# About the call / the process / the agency -- never about the candidate.
+_REACTION_ABOUT_THE_CALL = re.compile(
+    r"\b(?:call|conversation|discussion|chat|topic|focus|agenda|reiterate"
+    r"|repeat|team|client|company|colleague|recruiter|note\s+down|mentioned"
+    r"|discussed|question|answer|response|reply|goal|purpose|clarify"
+    r"|rephrase)\b",
+    re.I,
+)
+# About Riya. She is not the subject of a screening call.
+_REACTION_ABOUT_HERSELF = re.compile(
+    r"\b(?:I|I'm|I've|I'll|I'd|me|my|mine|myself|we|we're|we've|we'll|us"
+    r"|our|ours)\b"
+)
+# About the candidate -- the only subject a reaction is allowed to have.
+_REACTION_ABOUT_THEM = re.compile(r"\b(?:you|you're|you've|you'll|your|yours)\b", re.I)
+# "Yes No You have confirmed your tech stack." (run 45 turn 6). Both
+# polarities in the first two words: an answer the model never decided.
+# _only_a_fragment only sees this when the WHOLE reply is polarity, so a real
+# clause behind it hid the contradiction.
+_REACTION_CONTRADICTION = re.compile(
+    r"^\W*(?:(?:"
+    + "|".join(sorted(_AFFIRMATIVE))
+    + r")\W+(?:"
+    + "|".join(sorted(_NEGATIVE))
+    + r")|(?:"
+    + "|".join(sorted(_NEGATIVE))
+    + r")\W+(?:"
+    + "|".join(sorted(_AFFIRMATIVE))
+    + r"))\b",
+    re.I,
+)
+
+
+def _reaction_is_worth_saying(text: str) -> bool:
+    """May this be spoken as Riya's reaction to what the candidate just said?
+
+    A short CUT-LIST of subject-shaped tests, not another list of wordings.
+    Every test asks what the reaction is ABOUT: her, the call, the agency, a
+    tool, or the candidate's manner. If it is about none of those, it is about
+    the candidate, and it is spoken.
+
+    An ALLOWLIST was tried first and is recorded here because it failed:
+    requiring second person ("you"/"your") or two shared content words with
+    the candidate's utterance cut every PARAPHRASE the model wrote --
+    "That is a solid background." after "I have a masters in computer
+    science", "Got it, that is relevant." -- which are the reactions the
+    caller actually wants to hear. Good reactions paraphrase; that is the one
+    thing a word-overlap test cannot tolerate. So the overlap test is gone and
+    only the subjects are tested.
+    """
+    if not text or not text.strip():
+        return False
+    # The model asking something is the question machinery's job, not the
+    # reaction's. _strip_model_questions should already have taken it -- but
+    # run 46 turn 5 reached the gate as "can you specifically say how often
+    # you" with no "?" yet, so shape is tested as well as punctuation.
+    if "?" in text or _QUESTION_OPENER.match(text.strip()):
+        return False
+    # A yes/no answer the model never decided.
+    if _REACTION_CONTRADICTION.match(text):
+        return False
+    # About Riya, or about the call / the process / the agency.
+    if _REACTION_ABOUT_HERSELF.search(text):
+        return False
+    if _REACTION_ABOUT_THE_CALL.search(text):
+        return False
+    # About a technology, or about how they spoke.
+    if _REACTION_TOOL_CLAIM.search(text):
+        return False
+    if _REACTION_ON_THEIR_MANNER.search(text):
+        return False
+    # One line. A reaction this long is a speech, and every observed one was
+    # carrying a defect somewhere in it (run 45 turn 7, 16 words).
+    return len(text.split()) <= _REACTION_MAX_WORDS
 
 
 def _repair_chunk(
@@ -2905,7 +3092,11 @@ class VoiceAgent:
             # ---- 3. generate, with one retry if the guard rejects it -------
             live_item = self.agenda.current if self._has_persona else None
             spoken_text, stats, rejected = await self._generate_and_speak(
-                m, turn_id, stop_event, note, caller_said=text, agenda_item=live_item
+                m, turn_id, stop_event, note, caller_said=text, agenda_item=live_item,
+                # The reaction gate is safe here and nowhere else: _handle_turn
+                # is the only path that appends a templated question, so a
+                # dropped reaction still leaves the caller hearing a turn.
+                gate_reaction=self._has_persona and bool(self._questions),
             )
 
             # All retry policy now lives in _flag() inside _consume_chunks: it
@@ -2968,6 +3159,7 @@ class VoiceAgent:
                     # third generation. Repairs still run: this is the reply
                     # most likely to need them.
                     repair=True,
+                    gate_reaction=self._has_persona and bool(self._questions),
                 )
 
             m.llm_done_t = time.perf_counter()
@@ -3098,6 +3290,7 @@ class VoiceAgent:
         caller_said: str = "",
         agenda_item: str | None = None,
         repair: bool = True,
+        gate_reaction: bool = False,
     ) -> tuple[str, GenerationStats, tuple[str, str] | None]:
         """One generation pass. Returns (spoken, stats, rejection).
 
@@ -3106,6 +3299,11 @@ class VoiceAgent:
         assistant voice, or the caller's own words handed back.
 
         `repair` is independent of `guard` -- see _consume_chunks.
+
+        `gate_reaction` turns on the reaction allowlist. It is only safe where
+        a templated question is going to follow, because dropping the model's
+        line there still leaves the caller hearing a turn. Everywhere else it
+        would risk silence, so it defaults OFF and _handle_turn opts in.
         """
         chunk_queue: asyncio.Queue = asyncio.Queue()
         stats = GenerationStats()
@@ -3117,7 +3315,8 @@ class VoiceAgent:
         )
         thread.start()
         spoken, repeated = await self._consume_chunks(
-            chunk_queue, m, stop_event, guard, caller_said, agenda_item, repair
+            chunk_queue, m, stop_event, guard, caller_said, agenda_item, repair,
+            gate_reaction,
         )
         if repeated:
             # Stop the model finishing a reply we have already decided to bin.
@@ -3185,6 +3384,7 @@ class VoiceAgent:
         caller_said: str = "",
         agenda_item: str | None = None,
         repair: bool = True,
+        gate_reaction: bool = False,
     ) -> tuple[str, str]:
         """Synthesize and play chunks as they arrive.
 
@@ -3530,6 +3730,24 @@ class VoiceAgent:
                         "system", "(bail-out blocked; asking for a repeat)"
                     )
 
+                # The reaction gate. Runs AFTER the repairs (so a repaired
+                # chunk is judged on what is left of it) and BEFORE synthesis
+                # (so audio and transcript stay the same text -- the run 35
+                # bug, where cleaning _append_question left the audio dirty).
+                #
+                # Skipped once a bail-out has been substituted: that line is
+                # ours, not the model's, and it is about the candidate.
+                if (
+                    gate_reaction
+                    and not bailed[0]
+                    and not _reaction_is_worth_saying(item)
+                ):
+                    self.on_event(
+                        "system", f"(reaction dropped: {item[:50]!r})"
+                    )
+                    emptied = True
+                    continue
+
             if checking_open:
                 seen = " ".join(parts + [item])
 
@@ -3692,7 +3910,7 @@ class VoiceAgent:
             # advanced the checklist and were then read back as screening
             # data. _readable_answer drops disfluencies, counts CONTENT words
             # and caps the length -- see it for why each part is needed.
-            bit = _readable_answer(answer)
+            bit = _to_second_person(_readable_answer(answer))
             if not bit:
                 continue
             # Answers are included whole or not at all. Truncating one cuts
@@ -3859,6 +4077,13 @@ class VoiceAgent:
         spoken, stats, _rejected = await self._generate_and_speak(
             m, self._turn_id, stop_event, note,
             caller_said=user_text, agenda_item=live_item,
+            # Must match _handle_turn. Leaving this off is what made the gate
+            # look broken when it was first measured here: this path generated
+            # "Python and SQL are both popular tools" and spoke it, and the
+            # harness reported the gate had let it through -- when in fact the
+            # gate had never been asked. A verification harness that does not
+            # run the code under test proves nothing either way.
+            gate_reaction=self._has_persona and bool(self._questions),
         )
 
         m.llm_done_t = time.perf_counter()
