@@ -748,6 +748,33 @@ _META_COMMENT = re.compile(
     re.I,
 )
 
+# Narrating her OWN previous reply. Run 44 turn 12, after the caller had spent
+# six turns asking about underwear and hair: "My previous response should have
+# simply stated: Light blue." She is talking about her own output to the person
+# she is talking to -- the caller has no view of her previous response and no
+# interest in it. Worse, it admits the earlier answer was wrong, which invites
+# exactly the probing that produced it.
+#
+# Keyed on the SUBJECT (previous/last response|answer|reply) with the
+# self-correction verb left open, for the same reason _CLIENT_REQUIREMENT drops
+# its verb: "should have stated", "should have simply said", "could have been",
+# "should instead have answered" are all the same defect with different verbs,
+# and a verb list is what keeps missing the next one.
+_SELF_NARRATION = re.compile(
+    r"\b(?:"
+    r"my\s+(?:previous|last|earlier|prior)\s+(?:response|answer|reply|message)\b"
+    r"|(?:that|this)\s+(?:response|answer|reply)\s+(?:should|could|would|ought)\b"
+    r"|I\s+should\s+have\s+(?:simply\s+|just\s+)?"
+    r"(?:said|stated|answered|replied|responded)\b"
+    r"|(?:my|the)\s+(?:previous|last|earlier)\s+(?:one|turn)\b"
+    # No ":" in the lookahead, deliberately. The run-44 wording was "My
+    # previous response should have simply stated: Light blue." -- stopping at
+    # the colon cut the narration and left "Light blue." behind, which is the
+    # answer being narrated about. Run to the terminator instead.
+    r")[^.?!]{0,80}?(?=\s*(?:--|,|;|\.|!|\?|$))",
+    re.I,
+)
+
 # Explaining a term back to the person who asked about it. Run 26 turn 11: the
 # candidate said "What is data warehouse management system, what the fuck are
 # you talking about?" and got "Data warehouse management systems refer to
@@ -1204,6 +1231,7 @@ _MAY_EMPTY = frozenset({
     "commitment she cannot make",
     "narrated the machinery",
     "narrated the call",
+    "narrated her own reply",
     "commentary about the call",
     "claim about what the client wants",
 })
@@ -1282,7 +1310,12 @@ _COMMITMENT = re.compile(
 # writing one. Same move as _CLIENT_REQUIREMENT -- key on the invariant, not
 # on the phrasing the model reached for last time.
 _CALL_NARRATION = re.compile(
-    r"\b(?:during|in)\s+(?:our|this|the)\s+call\b[^.?!]{0,60}?"
+    # "call" was the only noun accepted here, and run 44 turn 3 went straight
+    # through it: "No information about personal appearance has been requested
+    # during our CONVERSATION so far". The identical sentence with "call"
+    # matched. The missing word was one token, and it cost a spoken sentence.
+    r"\b(?:during|in)\s+(?:our|this|the)\s+"
+    r"(?:call|conversation|chat|discussion)\b[^.?!]{0,60}?"
     r"(?=\s*(?:--|,|;|\.|!|\?|$))"
     r"|\b(?:as|like)\s+(?:we|i)\s+(?:discussed|mentioned|talked\s+about)\b"
     r"[^.?!]{0,60}?(?=\s*(?:--|,|;|\.|!|\?|$))"
@@ -1305,8 +1338,16 @@ _CALL_NARRATION = re.compile(
     r"|\b(?:about|regarding|concerning|on)\b(?:\s+[\w'\-]+){0,8}?"
     r")"
     r"\s+(?:was|were|is|are|has\s+been|have\s+been|had\s+been)\s+"
+    # "requested" and "asked" joined after run 44 turn 3: "No information about
+    # personal appearance has been requested during our conversation". Branch 1
+    # alone was not enough -- it matched the TAIL ("during our conversation")
+    # and left "No information about personal appearance has been requested"
+    # standing as a stranded sentence. Branch 3 has to match the whole thing,
+    # which means the verb has to be in this list.
     r"(?:mentioned|noted|discussed|covered|raised|brought\s+up|stated|said"
-    r"|given|provided|shared|received|made|recorded|confirmed)\b"
+    r"|given|provided|shared|received|made|recorded|confirmed"
+    r"|requested|asked|asked\s+for|sought|talked\s+about|spoken\s+about"
+    r"|indicated|specified)\b"
     r"[^.?!]{0,60}?(?=\s*(?:--|,|;|\.|!|\?|$))"
     r"|\b(?:earlier\s+in\s+the\s+call|in\s+this\s+conversation)\b",
     re.I,
@@ -1635,6 +1676,7 @@ def _repair_chunk(
             ("apology for the machinery", _META_APOLOGY),
             ("narrated the machinery", _MACHINERY_NARRATION),
             ("narrated the call", _CALL_NARRATION),
+            ("narrated her own reply", _SELF_NARRATION),
             ("commentary about the call", _META_COMMENT),
             ("definition of a term", _DEFINITION),
         ):

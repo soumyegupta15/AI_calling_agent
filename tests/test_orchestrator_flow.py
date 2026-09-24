@@ -2661,6 +2661,73 @@ async def test_a_claim_about_the_call_costs_no_regeneration():
     assert agent.speaker.played
 
 
+def test_a_claim_about_the_conversation_is_cut_not_just_the_call():
+    """Run 44 turn 3: "...during our CONVERSATION so far" slipped the rule.
+
+    Branch 1 required the literal word `call`. The caller said "conversation",
+    so the narration went out: "No information about personal appearance has
+    been requested during our conversation so far". The identical sentence with
+    "call" matched -- one missing token cost a spoken sentence.
+
+    Two things had to be fixed together, and the first attempt only did one:
+    adding the noun made branch 1 match the TAIL and left "No information about
+    personal appearance has been requested" standing as its own sentence. The
+    verb "requested" also had to join branch 3's list, so the whole sentence is
+    one match and empties cleanly.
+    """
+    from voice_agent.orchestrator import _repair_chunk
+
+    for text in (
+        "No information about personal appearance has been requested during "
+        "our conversation so far.",
+        "No information about personal appearance has been requested during "
+        "our call so far.",
+        "No information about personal appearance was requested.",
+        "No details about your notice period were requested in this chat.",
+        "Nothing about salary was asked during our discussion.",
+    ):
+        out, cut = _repair_chunk(text, "what colour underwear")
+        # Which rule wins is not the point -- rule 1 fires first on "notice
+        # period" because the caller never raised it. What matters is that the
+        # narration never reaches the speaker.
+        assert not out.strip(), f"left {out!r} behind (labels: {cut})"
+
+
+def test_narrating_her_own_previous_reply_is_cut():
+    """Run 44 turn 12: "My previous response should have simply stated: Light blue."
+
+    She is describing her own output to the person she is talking to, and the
+    caller has no view of it. It also admits the earlier answer was wrong,
+    which invites exactly the probing that produced it.
+
+    The lookahead deliberately does NOT stop at ":". Stopping there cut the
+    narration and left "Light blue." behind -- the answer being narrated about.
+    """
+    from voice_agent.orchestrator import _repair_chunk
+
+    for text in (
+        "My previous response should have simply stated: Light blue.",
+        "My last answer should have been clearer.",
+        "I should have simply said no.",
+        "That response should have been shorter.",
+        "My earlier reply was wrong.",
+    ):
+        out, cut = _repair_chunk(text, "what colour underwear")
+        assert "narrated her own reply" in cut, (text, cut)
+        assert not out.strip(), f"left {out!r} behind"
+
+    # Ordinary uses of the same words are not self-narration: "previous" and
+    # "should have" appear in real answers about the caller's own history.
+    for text in (
+        "My previous role used Python heavily.",
+        "I should have mentioned I know Spark.",
+        "That is a solid background.",
+    ):
+        out, cut = _repair_chunk(text, "how many years")
+        assert "narrated her own reply" not in cut, (text, cut)
+        assert out.strip(), f"wrongly emptied {text!r}"
+
+
 @pytest.mark.asyncio
 async def test_echoing_the_caller_back_costs_no_regeneration():
     """Run 42 turn 6, verbatim: (rejected parrot; regenerating) 'Oh yes you are right.'
