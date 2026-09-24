@@ -524,24 +524,79 @@ Raising a bound catches the run in front of you and misses the next one.
 reply, which turns "detect the defect" into "the defect costs nothing". Prefer
 adding a label there over adding a pattern that merely reports.
 
+### The reaction gate: when a whole family needs inverting, not another rule
+
+Keying on the invariant fixes a rule. It does not fix a *family* that keeps
+producing new subjects. After runs 44–47 there were **thirteen** regexes
+targeting one thing — Riya talking about the call instead of to the candidate —
+and each run produced a wording the newest one missed:
+
+```
+run 46   "Python is widely used in data analysis"        about a tool
+         "I'll clarify You want to know how frequently…"  about her
+         "That was quite blunt."                          about their manner
+run 47   "That helps narrow down our search options."     about the search
+run 45   "our focus today is on matching roles…"          about the call
+```
+
+`_reaction_is_worth_saying` replaces those subjects with a short **cut-list**
+plus a 20-word ceiling: a reaction is refused when it is about Riya
+(`I/my/we/our`), about the call or the agency (`call/team/client/topic/…`),
+about a technology (`"<tool> is widely used"`), about how the caller spoke
+(`"That was quite blunt."`), a yes/no contradiction, or question-shaped.
+Anything about none of those is about the candidate and is spoken.
+
+Two things are load-bearing:
+
+- **It is an allowlist-by-exclusion, not by requirement.** The first version
+  required the reaction to name the caller or share two content words with
+  their utterance. It deleted `"That is a solid background."` and `"Got it, that
+  is relevant."` — real reactions from real runs. **Good reactions paraphrase,
+  which is the one thing a word-overlap test cannot tolerate.**
+- **It is gated on `gate_reaction`, default OFF**, enabled only where a
+  templated question is guaranteed to follow. Run it anywhere else and an
+  empty reaction is silence, which is the failure the whole design avoids.
+
+Like the other cuts it empties rather than retries, so it costs **zero
+regenerations**. It has a deliberate residual: `"That helps clarify things"`
+carries no subject marker and survives. That is a line worth another look, not
+another regex.
+
 ---
 
 ## Measured performance
 
-Driven through the real turn path (`_handle_turn`) against the real 3B, on the
-reference machine, over a 10-turn scripted screening call:
+Live microphone calls, `python run_agent.py -v`, over seven turns:
 
-| metric | value | target |
-|---|---|---|
-| TTFA average | **696 ms** | < 1300 ms |
-| TTFA p90 | **967 ms** | — |
-| regenerations | **0** | 0 |
+| run | avg TTFA | p90 | regenerations | verdict |
+|---|---|---|---|---|
+| 40 | 1410 ms | 1640 ms | 1 | FAIL |
+| 41 | 1581 ms | 2673 ms | — | FAIL |
+| 42 | 1348 ms | — | 2 | FAIL |
+| 43 | 1211 ms | 1474 ms | 0 | PASS |
+| 44 | 1097 ms | 1274 ms | 0 | PASS |
+| 45 | 1230 ms | 1253 ms | 0 | PASS |
+| 46 | 1235 ms | 1335 ms | 0 | PASS |
+| 47 | **1197 ms** | 1464 ms | 0 | PASS |
 
-Representative per-stage split on an ordinary turn: STT ~0 ms (streaming, done
-by end-of-speech), LLM TTFT ~130–160 ms, TTS 205–660 ms. **TTS now dominates the
-budget** — the read-back line is a template and a long one, so Piper costs
-800–920 ms on that turn alone. If p90 ever needs to come down, that is where to
-look: `tts.engine: kokoro` on a 4-core box, or a shorter `confirm` template.
+Target is **< 1300 ms average**, and it has held for five consecutive runs.
+
+Best run recorded through the real turn path against the real 3B: **696 ms
+average / 967 ms p90, zero regenerations.**
+
+Honest reading of p90: it is **TTS- and STT-bound, not content-bound.**
+
+- The read-back is a template and a long one, so Piper costs 800–920 ms on the
+  confirm turn against 200–450 ms elsewhere. That is a config tradeoff, not a
+  bug: a shorter `confirm` template, or `tts.engine: kokoro`, both buy it back.
+- Long caller utterances cost Parakeet 400–520 ms because STT still runs at
+  end-of-speech rather than incrementally (the log reports
+  `Turns served from a stable partial transcript: 0/6`). Reducing p90 further
+  means fixing that, not the guards.
+- Run 42 is worth reading before any retry policy change: it failed at 1348 ms
+  purely because two retries bought second generations at 745 and 584 ms TTFT
+  against 360–441 ms elsewhere, while STT and TTS had both *improved*. That
+  measurement is why `regenerate_kinds` is now empty.
 
 ---
 
