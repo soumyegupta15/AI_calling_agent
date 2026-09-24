@@ -1,0 +1,50 @@
+########## CONTROL: all rules ##########
+[ablate] CONTROL: full _VOICE_RULES (3824 chars)
+Replaying a scripted screening call x6 (10 turns each)...
+[llm backend] class=OllamaLLM model=llama3.2:3b-instruct-q4_K_M base_url=http://127.0.0.1:11434
+
+==============================================================
+SUMMARY
+==============================================================
+Turns scored:      60
+Clean turns:       39/60 (65%)
+Violations/turn:   0.37
+
+By kind (turns affected):
+  unanswered             9  (15%)
+  off_topic              4  (7%)
+  double_terminator      3  (5%)
+  fabrication            2  (3%)
+  capability_speak       2  (3%)
+  assistant_speak        1  (2%)
+  wrong_person           1  (2%)
+
+Turn wall time:    avg 1617 ms  p90 2603 ms
+
+Gate (--fail-over 1.0): PASS
+########## ARM B: rules 1-8 ##########
+[ablate] KEEP 1-8: _VOICE_RULES 3824 -> 2002 chars
+Replaying a scripted screening call x6 (10 turns each)...
+[llm backend] class=OllamaLLM model=llama3.2:3b-instruct-q4_K_M base_url=http://127.0.0.1:11434
+
+==============================================================
+SUMMARY
+==============================================================
+Turns scored:      60
+Clean turns:       37/60 (62%)
+Violations/turn:   0.43
+
+By kind (turns affected):
+  double_terminator      6  (10%)
+  off_topic              6  (10%)
+  capability_speak       4  (7%)
+  fabrication            3  (5%)
+  unanswered             2  (3%)
+  assistant_speak        2  (3%)
+  agenda_echo            2  (3%)
+  wrong_person           1  (2%)
+
+Turn wall time:    avg 1551 ms  p90 2123 ms
+
+Gate (--fail-over 1.0): PASS
+########## ARM C: rules 1-9 ##########

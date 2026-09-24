@@ -1,0 +1,523 @@
+# =============================================================================
+#  Local CPU Real-Time Voice Agent - configuration
+#  Silero VAD -> Nemotron streaming ASR 0.6B -> Llama-3.2-3B -> Kokoro / Piper
+#  Combined model footprint: ~2.8 GB (llm 2.02 + stt 0.63 + tts 0.12 + vad 0.002)
+#  Fully offline. No GPU, no API keys, no network after the model download.
+#
+#  Thread allocation adapts to the machine at startup -- see plan_threads() in
+#  voice_agent/config.py. Nothing here is pinned to a core count, so the same
+#  config runs sensibly on a 2-core laptop and a 16-core desktop.
+# =============================================================================
+
+paths:
+  models_dir: models
+
+audio:
+  # Silero and Whisper both require 16 kHz mono. Do not change.
+  input_sample_rate: 16000
+  # Piper en_US-amy-medium emits 22.05 kHz. The speaker follows the TTS engine's
+  # actual rate at runtime, so this is informational.
+  output_sample_rate: 22050
+  # Silero VAD v5 requires exactly 512 samples per frame at 16 kHz (32 ms).
+  frame_samples: 512
+  # Playback block size in frames. 480 ~= 20 ms, so barge-in silences the
+  # speaker within 20-40 ms.
+  output_blocksize: 480
+  # The onboard mic array, by NAME on purpose.
+  #
+  # This was pinned to index 8, and that index is exactly what broke: Windows
+  # renumbers audio devices whenever a Bluetooth headset connects or drops, so
+  # index 8 pointed at a speaker instead of a mic and PortAudio answered
+  # -9998 "Invalid number of channels". A name substring survives renumbering.
+  #
+  # Why the onboard array rather than a headset: "Headset (OnePlus Buds 3)"
+  # is a Bluetooth HFP mic. HFP caps audio at a narrowband compressed codec
+  # (~8-16 kHz), well below what Parakeet expects, and stacking mic_gain on
+  # top of that degraded signal clips it -- the likely cause of garbage
+  # transcripts like "Febrics, fazer o Febrics".
+  #
+  # Several endpoints for this same mic refuse 16 kHz mono: WASAPI (shared
+  # mode will not resample, -9997 invalid sample rate) and WDM-KS (rejects
+  # most formats, host error). DirectSound is the one that accepts it.
+  # MicStream.start() now probes every candidate and falls back, so a wrong or
+  # stale value here degrades to the next working device instead of crashing.
+  # Run `python run_agent.py --list-devices` to see which are usable.
+  input_device: "Microphone Array"
+  output_device: null
+  # Multiplies the raw mic signal before VAD/STT see it. Was hardcoded to
+  # 6.0 in orchestrator.py (MicStream(..., gain=6.0)) with no way to tune
+  # it without a code edit. 6x is aggressive and clips easily, especially
+  # on an already-compressed Bluetooth mic. Start conservative and raise
+  # only if quiet speech is still missed.
+  # Raised 2.0 -> 3.0. The comment above says "raise only if quiet speech is
+  # still missed", and that is the report: short replies never reach STT and
+  # ordinary words come back wrong ("Manipal University jacket" for Jaipur,
+  # mangled the same way in runs 11 through 15). A quiet signal both under-
+  # triggers the VAD and gives Parakeet a poor waveform to work with.
+  # Stop at 3.0 -- 6.0 was the old hardcoded value and it clipped badly, which
+  # is its own source of garbage transcripts. If words are STILL wrong after
+  # this, clipping is the next suspect, not gain.
+  mic_gain: 3.0
+
+vad:
+  model_file: silero_vad.onnx
+  # Probability above which a frame counts as speech.
+  threshold: 0.25
+  # Must fall below this to count as silence (hysteresis, stops flapping).
+  # Was 0.35 -- too close to `threshold` (0.25). A single 32ms frame at/above
+  # neg_threshold resets the ENTIRE min_silence_ms clock back to zero, so any
+  # borderline noise (mic self-noise, breathing, a faint hum) intermittently
+  # crossing 0.35 could keep a turn open indefinitely -- observed live as a
+  # segment running the full 20s to max_speech_ms instead of closing on
+  # natural silence. Raised to 0.5 so only a clearly strong, unambiguous
+  # speech frame can reset the clock.
+  neg_threshold: 0.5
+  # Trailing silence that ends the caller's turn. This is pure dead air the
+  # caller feels, so keep it as low as you can stand: below ~350 ms the agent
+  # starts interrupting people who pause mid-sentence.
+  min_silence_ms: 400
+  # Reject blips (coughs, door slams, a chair moving) shorter than this. Raised
+  # from 200: live calls kept opening a turn on ~200 ms of room noise, which
+  # Parakeet then correctly transcribed as nothing, producing a run of "no
+  # speech recognized" notes. 250 ms is still well under a spoken "yes".
+  min_speech_ms: 250
+  # Audio kept before the first speech frame so the leading consonant survives.
+  # NOTE: this is padding ON TOP OF the frames the trigger consumed while it was
+  # deciding; TurnDetector sizes its buffer accordingly. It used to size it at
+  # speech_pad_ms alone, which meant no padding at all survived and the first
+  # ~130 ms of every utterance was thrown away -- "AWS" arrived as "WS".
+  speech_pad_ms: 250
+  max_speech_ms: 20000
+  # When the transcript ends on a dangling connector ("...experience, so"), the
+  # caller is mid-thought. Hold the fragment this long for them to continue
+  # before answering it anyway. Costs nothing on turns that end cleanly.
+  continuation_grace_ms: 900
+  # How long a still-generating turn is allowed to keep absorbing new speech
+  # as "the caller is still mid-sentence" (see _absorb_unspoken_turn in
+  # orchestrator.py). Past this, new speech is treated as its own turn
+  # instead of being glued onto a stale fragment. Matters most on a turn
+  # that got guard-rejected and is regenerating -- those can run several
+  # seconds, long enough for the caller to start a genuinely new thought.
+  max_absorb_wait_ms: 2500
+
+barge_in:
+  enabled: true
+  # While the agent speaks, the mic also hears it unless you wear headphones.
+  # These make barge-in deliberately harder to trigger during playback so the
+  # agent does not interrupt itself.
+  # Raised from 0.70/180: on open speakers the agent was cutting itself off
+  # repeatedly ("dropped 0.00s of audio" means it barged in on its own voice
+  # before any audio had even played). Use headphones if you can.
+  threshold: 0.90
+  min_speech_ms: 400
+  # Ignore the mic briefly after cutting playback (speaker ring-out).
+  cooldown_ms: 350
+
+stt:
+  #   --stt-engine nemotron | parakeet | vosk | whisper
+  # "nemotron" -> NVIDIA Nemotron cache-aware streaming ASR 0.6B. THE DEFAULT.
+  #               The only genuinely STREAMING engine here, and that is the
+  #               point: Parakeet and Whisper cannot start until the utterance
+  #               ends, so their whole cost (250-475 ms measured) sits on the
+  #               critical path. Nemotron consumes audio as it arrives and
+  #               reuses cached encoder state, so finalize() is nearly free.
+  #               6.93% avg WER at 1.12s chunks, 7.07% at 0.56s, with
+  #               punctuation and capitalisation built in.
+  # "parakeet"  -> NVIDIA Parakeet TDT 0.6B. Excellent accuracy, batch-only.
+  # "vosk"      -> streaming Kaldi. Fastest, least accurate. Fallback.
+  # "whisper"   -> faster-whisper int8. Kept for other languages.
+  engine: parakeet
+  # If the chosen engine cannot be loaded on this machine, use this instead
+  # rather than refusing to start. Nemotron needs either an onnx-asr release
+  # that knows 'nemotron_asr_streaming' or transformers >= 5.13; Parakeet needs
+  # only onnx-asr, which is already a dependency.
+  fallback_engine: nemotron
+
+  nemotron:
+    model_name: nvidia/nemotron-speech-streaming-en-0.6b
+    # Optional local directory; falls back to fetching by name.
+    model_dir: nemotron-speech-streaming-en-0.6b
+    quantization: int8        # ~630 MB
+    # Latency/accuracy operating point, chosen at RUNTIME with no reload.
+    # Valid steps are multiples of the model's 80 ms frame:
+    #   1120 -> 6.93% WER   560 -> 7.07%   160 -> 7.67%   80 -> 8.43%
+    # 560 is the sweet spot for a phone call: the VAD is already holding 400 ms
+    # of silence before it declares the turn over, so a bigger chunk would just
+    # add dead air for 0.14 points of WER.
+    chunk_ms: 560
+
+
+  parakeet:
+    # Weights come from Hugging Face on first use (~670 MB int8).
+    #   python scripts/download_models.py --only parakeet
+    model_name: nemo-parakeet-tdt-0.6b-v3
+    quantization: int8        # int8 | fp32 (fp32 is ~2.5 GB, do not)
+
+  vosk:
+    #   python scripts/download_models.py --only vosk
+    #   python scripts/download_models.py --only vosk --vosk-model en-us-0.22
+    model_dir: vosk-model-small-en-us-0.15
+
+  whisper:
+    # MUST be a CTranslate2 build. "distil-whisper/distil-small.en" on the Hub is
+    # the transformers format and fails with "Unable to open file 'model.bin'".
+    model_name: Systran/faster-whisper-base.en
+    compute_type: int8          # int8 | int8_float32 | float32
+    beam_size: 1                # greedy; 5 costs ~2x for little gain
+    chunk_length: 15            # encoder window; 30 = stock, lower is faster
+    # Whisper invents text from silence -- "Thank you.", "Thanks for watching!".
+    no_speech_threshold: 0.6
+    min_avg_logprob: -1.0
+
+  # Partial passes over a growing buffer. Irrelevant for vosk (streams natively)
+  # and not worth it for parakeet/whisper.
+  partial_interval_ms: 0
+  reuse_stable_partial: false
+  # Ignore utterances shorter than this (almost always noise or echo).
+  #
+  # Was 300. That silently discards a real answer: "Yes", "Okay", "Five" or
+  # "No" spoken normally can land under 300 ms, and they are exactly the
+  # answers a screening call is made of. Short replies were being reported as
+  # "no speech recognized" -- the audio never reached Parakeet at all.
+  # Lowering this does not let noise through as speech: a blip still has to
+  # pass min_speech_ms, and _is_noise_only() strips anything that decodes to
+  # filler. Worst case is a few more "ignored, no content" lines in the log.
+  min_audio_ms: 150
+
+llm:
+  # Llama-3.2-3B-Instruct. Markedly better instruction following than the 1.7B
+  # class, and no hybrid-reasoning mode to suppress. It is ~2x the compute per
+  # token, so on 2 physical cores expect time-to-first-token around 3-4 s; on
+  # 6+ cores it is comfortably the better choice.
+  model_file: Llama-3.2-3B-Instruct-Q4_K_M.gguf
+  hf_repo: bartowski/Llama-3.2-3B-Instruct-GGUF
+  hf_filename: Llama-3.2-3B-Instruct-Q4_K_M.gguf
+
+  # "server"  -> llama.cpp's official prebuilt llama-server binary, spawned and
+  #              owned by this process (LlamaServerLLM).
+  # "ollama"  -> an already-running `ollama serve` instance, model NOT owned by
+  #              this process -- it's whatever you've already pulled, e.g. the
+  #              hr-bot:latest / minicpm5 model (OllamaLLM). Set the model name
+  #              in llm.ollama.model below; llm.model_file / hf_repo /
+  #              hf_filename are ignored on this path.
+  backend: ollama
+
+  # "compact"/"full" -> the Riya recruiter persona (see prompts.py).
+  # "none" -> no system prompt at all. Plain, unprompted model -- no persona,
+  # no call framing, no agenda, no turn reminder.
+  system_prompt: compact
+
+  server:
+    binary: llama.cpp/llama-server.exe   # relative to paths.models_dir
+    host: 127.0.0.1
+    port: 8080
+    auto_start: true
+    startup_timeout_s: 180
+    # Llama 3.2 has no hybrid-reasoning mode, so none of the Qwen3 <think>
+    # suppression is needed here. SentenceChunker still strips reasoning tags as
+    # a belt-and-braces measure if you swap back to a thinking model.
+    extra_args:
+      - "--no-webui"
+
+  # Only read when backend: ollama. Left in place so switching backend: back
+  # to "server" needs no other edits -- the server: block above is untouched.
+  ollama:
+    host: 127.0.0.1
+    port: 11434
+    model: llama3.2:3b-instruct-q4_K_M
+    # 3072, measured -- do not lower it back to 2048.
+    #
+    # 2048 was sized when the system prompt was ~890 tokens. The screening
+    # prompt is ~1735, so prompt+generation was within ~60 tokens of the cap
+    # on turn 1 and pressed against it for the whole call. Ollama then shifts
+    # the window, the KV prefix stops matching, and every turn pays a full
+    # re-ingest. Run 4's symptom was prompt tokens climbing 1785 -> 1983 and
+    # then FLATTENING (1955) on a conversation that was still growing -- the
+    # history was being dropped, which is also why it re-asked a question it
+    # had already had answered.
+    #
+    # Measured on this machine, 12-turn conversation, average TTFT over the
+    # last 6 turns (see .pytest_tmp/ctx_probe2.py):
+    #     2048 -> 585 ms   100% GPU / 2.3 GB   (climbs to 1229 ms by turn 11)
+    #     3072 ->  96 ms    15% CPU / 85% GPU / 2.8 GB
+    #     4096 -> 128 ms    20% CPU / 80% GPU / 2.9 GB
+    # 3072 wins: it clears the cap, and keeps more of the model on the GPU
+    # than 4096 does. Re-check `ollama ps` after changing this -- if it drops
+    # to mostly-CPU, prefer a smaller context over a slower decode.
+    num_ctx: 3072
+    # Keeps the model resident between calls so a new call doesn't pay a cold
+    # load. Ollama's own default is 5m, which is too short for back-to-back
+    # calls in a calling agent -- bump it.
+    keep_alive: 30m
+    # Llama 3.2 has no hybrid-reasoning mode, unlike hr-bot's MiniCPM5 base --
+    # no <think> block to suppress here, so this key is a no-op left for
+    # documentation. Harmless either way.
+    think: false
+    # Ollama is a separate background service -- it does NOT respect the
+    # thread budget plan_threads() works out for llama-server (llm 4 gen /
+    # tts 2 / stt 2 / vad 1 on this 6-core machine). Left unset, Ollama uses
+    # its own default and can end up competing with Piper/STT for the same
+    # cores, which is the likely cause of Piper's first-audio time getting
+    # WORSE after the swap even though Piper itself didn't change. Pin it to
+    # roughly the same generation budget llama-server was given.
+    num_thread: 4
+    # Optional thread pin -- same idea as n_threads below, but Ollama has its
+    # own scheduler and usually doesn't need this set. Leave commented out
+    # first and only set it if you see it fighting your STT/TTS threads.
+    # num_thread: 4
+
+  n_ctx: 1792
+  n_batch: 256
+  # null = derived from the hardware profile (see voice_agent/config.py).
+  # Generation threads are what compete with TTS during the overlap window;
+  # batch threads run before any audio exists and can use the whole machine.
+  n_threads: null
+  n_threads_batch: null
+  temperature: 0.4         # was 0.6 (Qwen3 preset); lower = less fabrication
+  top_p: 0.95              # Qwen3 non-thinking preset
+  # Enforces the "1-2 sentences" rule structurally and caps worst-case latency.
+  max_tokens: 40
+  # Hard cap on sentences per turn, enforced by breaking the token stream rather
+  # than by asking the model nicely. max_tokens alone did not hold the line: a
+  # live turn produced a three-question ramble in 46 tokens, well inside budget.
+  max_sentences: 2
+  repeat_penalty: 1.15
+  # llama.cpp's default repeat window is 64 tokens -- shorter than one of Riya's
+  # own replies, so it could not see that she had already asked this exact
+  # question two turns ago. 512 covers the recent conversation.
+  repeat_last_n: 512
+  presence_penalty: 0.3
+  frequency_penalty: 0.2
+  # These must track whatever labels appear in the prompt. When the style
+  # examples switched to "Them:/You:" the stop list still said "Caller:/Riya:",
+  # and the model duly began every reply with a literal "You:" that went
+  # straight to the speaker. The examples are label-free prose now; these stay
+  # as a belt-and-braces net.
+  stop:
+    - "\nUser:"
+    - "\n["
+    - "\nRiya:"
+    - "\nCaller:"
+    - "\nYou:"
+    - "\nThem:"
+    - "You:"
+    - "Them:"
+  # Was 250. That is ~3-4 turns, which is shorter than the calls this thing
+  # actually runs: by the time the agenda reaches "read back and confirm?" the
+  # model can no longer SEE what the caller said at the start, so it invents
+  # the details instead of confirming them -- that is where the fabricated
+  # "B.Tech in Computer Science" came from. 600 covers a full call.
+  # Safe only because llm.ollama.num_ctx went 2048 -> 3072; the system prompt
+  # alone is ~1.7k tokens, so 600 of history leaves roughly 400 tokens of
+  # headroom. If TTFT regresses, drop this before touching num_ctx.
+  history_token_budget: 600
+  min_kept_turns: 1
+
+tts:
+  # "kokoro" -> Kokoro-82M ONNX. Much better voice, ~20x the compute per second
+  #             of audio. Viable from roughly 4 physical cores up.
+  # "piper"  -> tiny and extremely fast (realtime factor ~0.15 on ONE core).
+  # "auto"   -> kokoro when the machine has >= 4 physical cores, else piper.
+  #
+  # Whatever is chosen, build_tts MEASURES the realtime factor at warmup and
+  # drops to Piper if the engine cannot stay ahead of playback. A factor above
+  # 1.0 means synthesis is slower than speech, which stalls the call mid-
+  # sentence. This project measured Piper ~0.15 and Kokoro ~2.69 on one core.
+  engine: piper
+  # Fall back to Piper above this measured realtime factor.
+  max_realtime_factor: 0.6
+  # Keep Kokoro even when the RTF check fails. Piper stays installed as backup.
+  fallback_to_piper: true
+
+  kokoro:
+    model_file: kokoro-v1.0.int8.onnx
+    voices_file: voices-v1.0.bin
+    voice: af_heart
+    sample_rate: 24000
+
+  model_file: en_US-amy-medium.onnx
+  # Piper reads its config from <model>.json sitting next to the model.
+  voices_file: en_US-amy-medium.onnx.json
+  voice: amy
+  speed: 1.0
+  lang: en-us
+  # Sentence chunking for streaming synthesis. The FIRST chunk is allowed to be
+  # short so audio starts fast; later chunks are longer because playback is
+  # already running and bigger chunks have better prosody.
+  first_chunk_min_chars: 12
+  chunk_min_chars: 55
+  # If no sentence terminator has appeared by here, split on a comma or
+  # conjunction instead of stalling.
+  chunk_max_chars: 140
+  # Deadline for the FIRST chunk, measured from the first LLM token. Past it the
+  # chunker cuts at a word boundary even if no terminator has arrived, so a long
+  # unpunctuated run cannot hold first audio hostage. Measured on this machine:
+  # Piper synthesis is only ~110-155 ms (rtf 0.074), so the ~770 ms logged as
+  # "Piper first audio" was almost entirely time spent waiting for a terminator
+  # that never came -- the model joins clauses with " - " instead of periods.
+  first_chunk_max_ms: 280
+  # Shortest buffer that deadline may cut; below this it keeps waiting.
+  #
+  # Was 10. Run 16 logged "Piper first audio" 642 ms on all 12 turns, but real
+  # Piper is 110-155 ms (warmup measured 125 ms) and the number was FLAT -- it
+  # tracked neither text length ("No." 3 chars -> 632 ms; a 91-char reply ->
+  # 598 ms) nor token count (37 tok -> 638 ms; 21 tok -> 647 ms). So the time
+  # is spent waiting for text, not synthesising it. Once the deadline has
+  # passed, _force_split re-arms on every token push, so the binding value is
+  # how little text we will accept as speakable: 6 chars is roughly one short
+  # word pair ("Sure,", "Right --"), which is audible and not a clipped
+  # syllable. Lower only with a live run to confirm.
+  emergency_min_chars: 6
+
+# =============================================================================
+#  The call itself. This is an OUTBOUND call: Riya dials the candidate.
+#  These values are interpolated into the system prompt, so the agent always
+#  knows why it rang, and never has to ask the caller what they want.
+#  Change the role here and the whole conversation retargets.
+# =============================================================================
+call:
+  direction: outbound
+  candidate_name: ""                  # e.g. "Satyam" -- blank if unknown
+  role: "Senior Data Engineer"
+  client: "a healthcare analytics client"
+  location: "Bengaluru, hybrid three days onsite"
+  engagement: "12-month contract-to-hire"
+  must_haves: "Python, Spark, AWS, and production pipeline ownership"
+  source: "your profile came up in our database"
+  # Deliberately no rate. Riya must never quote a number on a first call.
+
+agent:
+  name: Riya
+  # Spoken at startup. Empty string = silent start.
+  #
+  # This is an outbound opener: Riya rang THEM. The old greeting ("Are you
+  # calling about a role you need filled?") asked the person why they had
+  # called, which is why the test caller ended up saying "no no, you called me".
+  # Keep it to one breath -- state who you are, why you rang, ask permission.
+  # Two sentences, ~5 seconds. The three-sentence version ran about eight, and
+  # callers talked over it every time -- one live call opened with the whole
+  # greeting being cut after 7.66 s. On a phone call the other person expects a
+  # gap almost immediately, so state who you are, why you rang, and stop.
+  greeting: "Hi, this is Riya calling from IT Staffing Solutions -- your profile came up for a Senior Data Engineer role with a healthcare analytics client. Have you got a couple of minutes to chat?"
+  # How many leading checklist items the greeting already asks.
+  #
+  # 0, not 1. This used to be 1 on the reasoning that "have you got a couple of
+  # minutes?" was the first checklist item -- true of an older agenda whose item
+  # one was "bad time?". The current checklist opens with "qualification and
+  # field?", which the greeting never asks, so 1 silently skipped it: the
+  # pointer started at "years of experience?" and Riya was then REJECTED for
+  # asking about qualifications (run 11, turn 1, off_agenda) -- she was asking
+  # the item the tracker had thrown away. Permission to talk is not a screening
+  # question. Set to 1 only if the greeting genuinely asks item one.
+  greeting_covers: 0
+
+  # The questions Riya asks, written here instead of by the model.
+  #
+  # This is the single most important decision in the config, and it exists
+  # because of what runs 27-33 actually showed: a 3B model asked to compose its
+  # own screening questions produces a NEW failure phrasing every single run --
+  # the checklist item read aloud, two questions in one turn, a question
+  # already answered, a question about "our recruitment team", a question that
+  # promises a callback, third person. Chasing those with patterns does not
+  # converge; the model invents phrasing faster than it can be matched.
+  #
+  # So the model no longer writes questions at all. It writes one line of
+  # reaction to what the caller just said, and Python appends the line below
+  # for whichever checklist item is live. Keyed by the item's topic:
+  # qualification / experience / tech / confirm / closing.
+  #
+  # Rules for editing these:
+  #  - One sentence, one question, second person ("you", never "they"/"we").
+  #  - No commitment: no interview, no callback, no date, no colleague's name,
+  #    no "we'll be in touch". Riya has none of those to give.
+  #  - Ask, don't tell. "Our team will discuss salary separately" is a
+  #    deflection that reads as a brush-off; it is not in here on purpose.
+  questions:
+    qualification: "What is your highest qualification, and in which field?"
+    experience: "How many years of total work experience do you have?"
+    tech: "Which technologies are you working with day to day?"
+    confirm: "Let me read that back. {answers}. Have I got that right?"
+    closing: "That's everything I need -- thank you for your time today."
+    # Said only once the checklist has run out, i.e. after `closing` has
+    # already gone out. It has to be a DIFFERENT line: "close the call" is the
+    # last checklist item and it maps to the same topic, so falling back to
+    # `closing` made Riya say the identical goodbye twice in a row (run 39
+    # turns 5 and 6). It has to be A line, not none -- the hangup arms at
+    # farewell 2/2, so with no second sign-off the call never ends.
+    wrapup: "Have a good day, and thanks for your time."
+  # Fill-in for the read-back when nothing has been captured yet. Without it
+  # the confirm line would read back an empty string; two items is the floor
+  # for a read-back that sounds like one.
+  readback_fallback: "your background so far"
+  # How long to hold the line after Riya's last goodbye before actually
+  # dropping the call, in milliseconds.
+  #
+  # 2500. Riya saying goodbye is not the same as the caller being finished.
+  # Hanging up the instant she stopped talking cut a real caller off
+  # mid-sentence twice (run 27, run 30) -- they were answering, or starting to
+  # ask something, when the line went dead. If they begin speaking inside this
+  # window the hang-up is cancelled and the call continues. Raise it if callers
+  # are slow to come back; the cost of a larger window is one extra turn.
+  hangup_grace_ms: 2500
+  # Whether a guard rejection triggers a SECOND generation.
+  #
+  # false. Every live run says the retry is worse than the failure it fixes:
+  #   run 13  retry opened "I shouldn't say 'we'." -- narrating the rule
+  #   run 14  retry said "No such position exists at my current company" and
+  #           "We currently have several positions available; however, those
+  #           are internal roles mostly" -- both fabrications, both spoken
+  # And it is expensive: +850 ms per rejection in run 12, +1800 ms in run 14
+  # (one turn hit 4553 ms against a 343 ms clean turn). A 3B model cannot
+  # repair itself from a correction note; it pivots to a different failure.
+  #
+  # With this false the guard still runs and still filters malformed output
+  # (stray tool-call tags etc.), but a rejected reply is spoken rather than
+  # regenerated. Set to true only if you would rather pay ~2x latency per
+  # rejected turn for a second attempt at the wording.
+  regenerate_on_guard_rejection: false
+  # Failure kinds that get a second generation EVEN THOUGH the setting above
+  # is false. Empty list = warn-only for everything.
+  #
+  # Why these three and not the others. Run 20 was the first run where the
+  # guard was actually reporting, and it reported:
+  #   turn 1  off_topic 'salary'
+  #   turn 7  parrot    'Yes.'
+  #   turn 11 repeat    'Our recruitment team will discuss salary...'
+  #   turn 11 question  '...openings in AI engineers?'
+  #   turn 9  off_topic 'interview'
+  # "repeat", "parrot" and "agenda" are MECHANICAL: the model emitted text it
+  # had already emitted, echoed the caller's own words back, or read out a
+  # checklist note. correction_note() names the exact offending string, so the
+  # second pass has something concrete to avoid, and the first pass is
+  # unusable by definition -- there is nothing to salvage.
+  #
+  # "fabrication", "person", "off_agenda" and "off_topic" are deliberately NOT
+  # here. Every live run that retried those made things worse:
+  #   run 13  retry opened "I shouldn't say 'we'."
+  #   run 14  retry said "No such position exists at my current company"
+  # A 3B asked to stop inventing invents something different. Those stay
+  # warn-only: visible in the log, still spoken, no latency cost.
+  #
+  # COST: ~850 ms per retried turn (measured run 12). Run 20 had 2 hits in 11
+  # turns, so expect roughly +150 ms on the TTFA average. If the definition of
+  # done starts failing, empty this list before touching anything else.
+  #
+  # EMPTIED AFTER RUN 42, which is the measurement that settled it. Run 42
+  # failed at 1348 ms avg with the summary printing "2/6 turns regenerated
+  # after a guard rejection". Those two turns logged TTFT 745 and 584 ms
+  # against 360-441 ms everywhere else -- and every OTHER stage had improved
+  # versus run 41 (STT 470 -> 345, TTS 731 -> 512). The retry policy was the
+  # entire regression.
+  #
+  # Emptying this does NOT mean those defects are allowed through: repeat,
+  # parrot and agenda are now CUT instead of retried (see _CUT_KINDS in
+  # orchestrator.py). The offending text is dropped, the templated question
+  # still goes out, and the turn costs one generation instead of two. A warn
+  # would have let the text through; a retry paid ~250 ms extra TTFT to be
+  # told the same thing twice.
+  #
+  # To restore retries, put the kinds back here -- that takes precedence over
+  # cutting.
+  regenerate_kinds: []
+  show_metrics: true
+  show_partials: false

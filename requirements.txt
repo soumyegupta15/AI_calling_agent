@@ -1,0 +1,46 @@
+# Local CPU real-time voice agent - Python 3.10 to 3.13
+# Silero VAD -> distil-Whisper small.en (int8) -> Qwen2.5-1.5B-Q4_K_M -> Piper
+#
+# The LLM is NOT a Python dependency: config.yaml drives llama.cpp's official
+# prebuilt llama-server binary over loopback HTTP (stdlib urllib only), so there
+# is no compiler and no version-specific wheel to fight.
+# Fetch it with:  python scripts/download_models.py --only llamacpp
+
+# --- core runtime ---
+numpy>=1.24,<2.3
+sounddevice>=0.4.6
+onnxruntime>=1.17          # Silero VAD only
+PyYAML>=6.0
+psutil>=5.9
+
+# --- STT: three engines, pick with stt.engine ---
+# parakeet = NVIDIA Parakeet TDT 0.6B v3 int8 ONNX (DEFAULT, most accurate)
+# vosk     = streaming Kaldi recognizer (lowest latency, least accurate)
+# whisper  = faster-whisper / CTranslate2 int8 (kept for comparison)
+onnx-asr[cpu,hub]>=0.12
+
+# nemotron = NVIDIA Nemotron cache-aware streaming ASR 0.6B (DEFAULT STT).
+# Loaded through onnx-asr when a release supports the architecture; otherwise
+# through Transformers, which is the reference implementation but pulls torch.
+#   pip install "transformers>=5.13.0"
+# The lightest CPU runtime is NVIDIA's own NeMo-Speech.cpp with the q8_0 GGUF:
+#   https://github.com/NVIDIA/NeMo-Speech.cpp
+huggingface_hub>=0.24
+
+# kokoro = Kokoro-82M int8 ONNX TTS. Much better voice than Piper, ~20x the
+# compute per second of audio, so it is auto-selected only on >= 4 physical
+# cores and dropped if the measured realtime factor cannot keep up.
+kokoro-onnx>=0.4 ; python_version >= "3.10"
+espeakng-loader>=0.2 ; python_version >= "3.10"
+vosk>=0.3.45
+faster-whisper>=1.0
+
+# --- TTS: Piper ---
+piper-tts>=1.6
+
+# --- model download ---
+huggingface-hub>=0.23
+
+# --- dev / test ---
+pytest>=8.0
+pytest-asyncio>=0.23
