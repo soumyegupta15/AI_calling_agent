@@ -84,7 +84,7 @@ class FakeLLM:
                 if stats:
                     stats.interrupted = True
                 return
-            time.sleep(self.delay_s)
+            time.sleep(self.delay_s)                
             self.tokens_emitted += 1
             if stats:
                 stats.tokens = self.tokens_emitted
